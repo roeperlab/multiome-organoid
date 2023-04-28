@@ -12,6 +12,6 @@ GEO: (coming soon)
 # Analysis pipeline
 This repository contains the following files which illustrate the methodology in our paper.
 
-SC_analysis_pipeline_batch1.R (single cell analysis pipeline for batch 1)
-SC_analysis_pipeline_batch2.R (single cell analysis pipeline for batch 2)
-SC_analysis_pipeline_batch3.R (single cell analysis pipeline for batch 3)
+- SC_analysis_pipeline_batch1.R (single cell analysis pipeline for batch 1)
+- SC_analysis_pipeline_batch2.R (single cell analysis pipeline for batch 2)
+- SC_analysis_pipeline_batch3.R (single cell analysis pipeline for batch 3)
