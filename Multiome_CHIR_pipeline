@@ -1,4 +1,4 @@
-# Code to process batch 3 data to generate plots and analysis for Figure 7
+# Code to process batch 3 Multi-ome dataset to generate plots and analysis for Figure 7
 
 library(ArchR)
 library(presto)
