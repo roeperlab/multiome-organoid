@@ -1,0 +1,310 @@
+# Code to process batch 3 data to generate plots and analysis for Figure 7
+
+library(ArchR)
+library(presto)
+library(dplyr)
+library(JASPAR2020)
+library(TFBSTools)
+library(viridis)
+library(Hmisc)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(ggplot2)
+library(parallel)
+library(RColorBrewer)
+
+set.seed(1)
+addArchRThreads(threads = 1) 
+addArchRGenome("hg38")
+
+setwd("~/Desktop/ArchR_analysis")
+
+##################################################
+
+#ArchRProject
+arrowlist<-list.files(pattern=".arrow")
+Multiproj<-ArchRProject(ArrowFiles=arrowlist, outputDirectory="Multi-out", copyArrows=T)
+
+####### Load seRNA #########
+names<-gsub(".arrow", "", arrowlist)
+files<-paste("~/Desktop//", names, "/filtered_feature_bc_matrix.h5", sep="")
+seRNA <- import10xFeatureMatrix(input = files, names = names)
+
+#Add snRNA-Seq datasets:
+Multiproj<-addGeneExpressionMatrix(input=Multiproj, seRNA=seRNA)
+
+#Filter Cells
+Multiproj <- Multiproj[!is.na(Multiproj@cellColData$Gex_nGenes) & 
+                           Multiproj$TSSEnrichment > 6 & 
+                           Multiproj$nFrags > 2500 & 
+                           Multiproj$Gex_nGenes > 1000 & 
+                           Multiproj$Gex_nUMI > 5000]
+
+#LSI-ATAC
+Multiproj <- addIterativeLSI(
+  ArchRProj = Multiproj, 
+  clusterParams = list(
+    resolution = 0.2, 
+    sampleCells = 10000,
+    n.start = 10),
+  saveIterations = FALSE,
+  useMatrix = "TileMatrix", 
+  depthCol = "nFrags",
+  name = "LSI_ATAC",
+  iterations = 2,
+  force = TRUE)
+
+#LSI-RNA
+Multiproj <- addIterativeLSI(
+  ArchRProj = Multiproj, 
+  clusterParams = list(
+    resolution = 0.2, 
+    maxClusters=NULL,
+    sampleCells = 10000,
+    n.start = 10),
+  saveIterations = FALSE,
+  useMatrix = "GeneExpressionMatrix", 
+  depthCol = "Gex_nUMI",
+  firstSelection = "Var",
+  binarize = FALSE,
+  name = "LSI_RNA",
+  varFeatures = 2500,
+  force = T)
+
+#Combined Dims
+Multiproj <- addCombinedDims(Multiproj, reducedDims = c("LSI_ATAC", "LSI_RNA"), name =  "LSI_Combined",
+                              dimWeights = c(5,5))
+
+# Add UMAP and Clusters
+Multiproj <- addUMAP(Multiproj, reducedDims = "LSI_ATAC", name = "UMAP_ATAC", minDist = 0.8, force = TRUE)
+Multiproj <- addClusters(Multiproj, reducedDims = "LSI_ATAC", name = "Clusters_test", resolution = 1.4, force = TRUE)
+
+# Subset Project - remove clusters 3 and 4 (poor quality) and 8 and 9 (stressed)
+C1 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C1"), ])
+C2 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C2"), ])
+C5 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C5"), ])
+C6 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C6"), ])
+C7 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C7"), ])
+C10 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C10"), ])
+C11 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C11"), ])
+C12 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C12"), ])
+C13 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C13"), ])
+C14 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C14"), ])
+C15 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C15"), ])
+C16 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C16"), ])
+C17 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C17"), ])
+C18 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C18"), ])
+C19 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C19"), ])
+C20 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C20"), ])
+
+Multiproj_sub <- subsetArchRProject(
+  ArchRProj = Multiproj,
+  cells = c(C1, C2, C5, C6, C7, C10, C11, C12, C13, C14, C15, C16, C18, C19, C20),
+  outputDirectory = "ArchRSubset_big_CHIR",
+  dropCells = TRUE,
+  logFile = NULL,
+  threads = getArchRThreads(),
+  force = T)
+
+Multiproj_sub <- addImputeWeights(Multiproj_sub, reducedDims = "LSI_ATAC")
+Multiproj_sub <- addUMAP(Multiproj_sub, reducedDims = "LSI_ATAC", name = "UMAP_ATAC", force = TRUE,
+                              minDist = 0.8, dims = c(1:30))
+
+# Plot in Supplemental Fig. S7
+plotEmbedding(Multiproj_sub, 
+                    name = "Sample", 
+                    embedding = "UMAP_ATAC",
+                    labelAsFactors=F, 
+                    labelMeans=F,
+                    colorBy = "cellColData",
+                    plotAs = "points",
+                    size = 1.5,
+                    baseSize = 10,
+                    discreteSet = "stallion")+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_text(hjust = 0, vjust=2.5),
+        axis.title.y=element_text(hjust = 0, vjust=-1.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = 'white', colour = 'white'),
+        line = element_blank(),
+        plot.title = element_text(hjust = 0, vjust=-1.5)
+  )+labs(title=NULL,x="UMAP 1", y = "UMAP 2")
+
+
+#  Subset Project # 2 - Epithelial cells only
+Multiproj_sub <- addClusters(Multiproj_sub, reducedDims = "LSI_ATAC", name = "Clusters_test", resolution = 0.2, force = TRUE)
+plotEmbedding(Multiproj_sub, name = "Clusters_test", embedding = "UMAP_ATAC", size = 1.5, labelAsFactors=F, labelMeans=F)
+C3 <- getCellNames(Multiproj_sub[Multiproj_sub$Clusters_test==c("C3"), ])
+C5 <- getCellNames(Multiproj_sub[Multiproj_sub$Clusters_test==c("C5"), ])
+C6 <- getCellNames(Multiproj_sub[Multiproj_sub$Clusters_test==c("C6"), ])
+C7 <- getCellNames(Multiproj_sub[Multiproj_sub$Clusters_test==c("C7"), ])
+
+Multiproj_sub #13502
+length(c(C3, C5, C6, C7)) # 10793 cells
+
+Multiproj_sub_EPI <- subsetArchRProject(
+  ArchRProj = Multiproj_sub,
+  cells = c(C3, C5, C6, C7),
+  outputDirectory = "ArchRSubset_big_CHIR_EPI",
+  dropCells = TRUE,
+  logFile = NULL,
+  threads = getArchRThreads(),
+  force = T)
+
+Multiproj_sub_EPI #13589 cells
+Multiproj_sub_EPI <- addImputeWeights(Multiproj_sub_EPI, reducedDims = "LSI_ATAC")
+Multiproj_sub_EPI <- addUMAP(Multiproj_sub_EPI, reducedDims = "LSI_ATAC", name = "UMAP_ATAC", force = TRUE,
+                                  minDist = 0.8, dims = c(1:30))
+
+# Plot in Fig. 7C
+plotEmbedding(Multiproj_sub_EPI, 
+                    name = "Clusters_0.1", 
+                    embedding = "UMAP_ATAC",
+                    labelAsFactors=F, 
+                    labelMeans=F,
+                    colorBy = "cellColData",
+                    plotAs = "points",
+                    size = 1.5,
+                    baseSize = 10,
+                    pal=c("C1" = "#D51F26", "C3" = "#272E6A", "C4" = "#208A42", "C2" = "#90D5E4"))+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_text(hjust = 0, vjust=2.5),
+        axis.title.y=element_text(hjust = 0, vjust=-1.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = 'white', colour = 'white'),
+        line = element_blank(),
+        plot.title = element_text(hjust = 0, vjust=0)
+  )+labs(x="UMAP 1", y = "UMAP 2")
+
+# Adding motif accessibility
+
+# Get a list of motif position frequency matrices from the JASPAR database
+pwm_set1 <- getMatrixSet(x = JASPAR2020, opts = list(all_versions = FALSE, species = 9606, collection="CORE", matrixtype="PWM"))
+pwm_set2 <- getMatrixSet(x = JASPAR2020, opts = list(all_versions = FALSE, species = 9606, collection="UNVALIDATED", matrixtype="PWM"))
+# Need to manually add motifs for Pax2, Sall1, Mafb, Wt1 and Twist2 as these are missing from JASPAR2020
+
+names(pwm_set) <- name(pwm_set) #converts Motif IDs to gene names
+pwm_set[duplicated(names(pwm_set)),] #13 duplicates
+names(pwm_set) <- make.unique(names(pwm_set)) #adds a unique suffix onto end of duplicates
+
+Multiproj_sub_EPI <- addMotifAnnotations(ArchRProj = Multiproj_sub_EPI, 
+                                              motifPWMs = pwm_set, 
+                                              name = "JASPAR", 
+                                              force = TRUE)
+Multiproj_sub_EPI <- addBgdPeaks(Multiproj_sub_EPI, force = TRUE)
+Multiproj_sub_EPI <- addDeviationsMatrix(
+  ArchRProj = Multiproj_sub_EPI, 
+  peakAnnotation = "Motif",
+  matrixName = "JASPAR",
+  force = TRUE)
+
+
+# Gene expression analysis
+# C2 = CHIR,  C4 = DMSO
+
+markersGS <- getMarkerFeatures(
+  ArchRProj = Multiproj2_sub_big_EPI, 
+  useMatrix = "GeneExpressionMatrix", 
+  groupBy = "Clusters_0.1",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"),
+  useGroups = c("C4","C2"))
+
+markerList <- getMarkers(markersGS, cutOff = "FDR <= 0.01 & Log2FC >= 1")
+markerList.mat <- as.data.frame(markerList)
+sum(markerList.mat$group_name=="C4") #954 (DMSO)
+sum(markerList.mat$group_name=="C2") #715 (CHIR)
+
+markerList.mat$group_name[markerList.mat$group_name=="C4"] <- "DMSO"
+markerList.mat$group_name[markerList.mat$group_name=="C2"] <- "CHIR"
+
+write.csv(markerList.mat[,c(2,7,9,10,11)], file = "~/Desktop/Supplemental Table 6 - DMSOvCHIR genes.csv")
+
+
+# Heatmap in Fig. 7D
+heatmapGS <- plotMarkerHeatmap(
+  seMarker = markersGS, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 1",
+  transpose = F,
+  plotLog2FC = TRUE,
+  clusterCols = F,
+  nLabel = 5,
+  nPrint = 5,
+  pal = viridis(100))
+draw(heatmapGS, 
+     heatmap_legend_side = "bot", 
+     annotation_legend_side = "bot")
+
+
+# Chromatin Accessibility analysis
+# C2 = CHIR,  C4 = DMSO
+
+markers_ALL_DMSOvsCHIR_PEAKS <- getMarkerFeatures(
+  ArchRProj = Multiproj_sub_EPI, 
+  useMatrix = "PeakMatrix",
+  groupBy = "Clusters_0.1",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"),
+  useGroups = c("C4","C2"))
+
+markerList_peaks <- getMarkers(markers_ALL_DMSOvsCHIR_PEAKS, cutOff = "FDR <= 0.01 & Log2FC >= 1")
+markerList_peaks.mat <- as.data.frame(markerList_peaks)
+
+sum(markerList_peaks.mat$group_name=="C2") #5106 CHIR-specific peaks
+sum(markerList_peaks.mat$group_name=="C4") #1209 DMSO-specific peaks
+
+# Heatmap in Fig. 7G
+heatmapPeaks <- plotMarkerHeatmap(
+  seMarker = markers_ALL_DMSOvsCHIR_PEAKS, 
+  cutOff = "FDR <= 0.1 & Log2FC >= 1", 
+  labelMarkers = NULL,
+  transpose = F,
+  plotLog2FC = TRUE,
+  clusterCols = F,
+  nLabel = 5,
+  nPrint = 5)
+
+
+# Heatmap of top Vierstra motif families
+Multiproj_sub_EPI_vierstra <- addMotifAnnotations(
+  ArchRProj = Multiproj_sub_EPI,
+  motifSet = "vierstra",
+  name = "Vierstra",
+  collection = "archetype",
+  cutOff = 5e-05,
+  width = 7,
+  version = 2,
+  logFile = createLogFile("addMotifAnnotations"),
+  force = TRUE)
+
+#selecting peaks that have an FDR <= 0.1 & Log2FC >= 1
+markers_ALL_EvS_PEAKSMotifsUp <- peakAnnoEnrichment(
+  seMarker = markers_ALL_DMSOvsCHIR_PEAKS,
+  ArchRProj = Multiproj_sub_EPI_vierstra,
+  peakAnnotation = "Motif",
+  cutOff = "FDR <= 0.01 & Log2FC >= 1",
+  background = "all")
+
+heatmapEM.markers_ALL_EvS_PEAKSMotifsUp <- plotEnrichHeatmap(markers_ALL_EvS_PEAKSMotifsUp, n = 20, transpose = F, rastr = F,  clusterCols = T, returnMatrix = T)
+heatmapEM.markers_ALL_EvS_PEAKSMotifsUp.df <- as.data.frame(heatmapEM.markers_ALL_EvS_PEAKSMotifsUp)
+heatmapEM.markers_ALL_EvS_PEAKSMotifsUp.df.split <- str_split(rownames(heatmapEM.markers_ALL_EvS_PEAKSMotifsUp.df), pattern = "\\(", n = Inf, simplify = T)
+rownames(heatmapEM.markers_ALL_EvS_PEAKSMotifsUp.df) <- heatmapEM.markers_ALL_EvS_PEAKSMotifsUp.df.split[,1]
+rownames(heatmapEM.markers_ALL_EvS_PEAKSMotifsUp.df) <- gsub("\\|", "\\ | ", rownames(heatmapEM.markers_ALL_EvS_PEAKSMotifsUp.df))
+
+# Heatmap in Fig. 7H
+pheatmap::pheatmap(heatmapEM.markers_ALL_EvS_PEAKSMotifsUp.df, 
+                   cluster_cols = F, 
+                   clustering_method = "ward.D2",
+                   clustering_distance_rows = "minkowski",
+                   treeheight_row = 15)
+
