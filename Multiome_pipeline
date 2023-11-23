@@ -1,8 +1,9 @@
+# Code to process batch 3 Multi-ome dataset to generate plots and analysis for Figures 1, 2 and 6
+
 library(ArchR)
 library(presto)
 library(dplyr)
 library(tidyverse)
-library(EnhancedVolcano)
 library(JASPAR2020)
 library(TFBSTools)
 library(viridis)
@@ -11,7 +12,6 @@ library(EnsDb.Hsapiens.v86)
 library(BSgenome.Hsapiens.UCSC.hg38)
 library(ggplot2)
 library(directlabels)
-
 
 set.seed(1)
 addArchRThreads(threads = 4) 
