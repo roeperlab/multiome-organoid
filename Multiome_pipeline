@@ -1,4 +1,5 @@
 # Code to process batch 3 Multi-ome dataset to generate plots and analysis for Figures 1, 2 and 6
+# A analogous pipeline was applied to analyse the confirmation Multi-ome dataset (batch 2)
 
 library(ArchR)
 library(presto)
