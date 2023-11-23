@@ -1,0 +1,849 @@
+library(ArchR)
+library(presto)
+library(dplyr)
+library(tidyverse)
+library(EnhancedVolcano)
+library(JASPAR2020)
+library(TFBSTools)
+library(viridis)
+library(Hmisc)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(ggplot2)
+library(directlabels)
+
+
+set.seed(1)
+addArchRThreads(threads = 4) 
+addArchRGenome("hg38")
+
+library(future)
+plan("multisession", workers = 4) ### Use this to parallelize
+
+setwd("~/Desktop/ArchR_analysis")
+
+####################################################
+
+#Create Arrow Files
+#Get Input Fragment Files
+day_10_inputFiles <- getInputFiles("~/Desktop/ArchR_analysis/2_Day_10/")[1]
+names(day_10_inputFiles) <- "Day_10"
+
+day_12_inputFiles <- getInputFiles("~/Desktop/ArchR_analysis/2_Day_12/")[1]
+names(day_12_inputFiles) <- "Day_12"
+
+day_14_inputFiles <- getInputFiles("~/Desktop/ArchR_analysis/2_Day_14/")[1]
+names(day_14_inputFiles) <- "Day_14"
+
+day_10_arrow <- "Day_10.arrow"
+day_12_arrow <- "Day_12.arrow"
+day_14_arrow <- "Day_14.arrow"
+
+day_10_arrow <- createArrowFiles(day_10_inputFiles, force = TRUE) 
+day_12_arrow <- createArrowFiles(day_12_inputFiles, force = TRUE) 
+day_14_arrow <- createArrowFiles(day_14_inputFiles, force = TRUE) 
+
+
+#ArchRProject
+arrowlist<-list.files(pattern="2_Day_1[^*].arrow")
+Multiproj<-ArchRProject(ArrowFiles=arrowlist, outputDirectory="Multi-out", copyArrows=TRUE)
+
+#Loading multiple snRNA-Seq datasets:
+names<-gsub(".arrow", "", arrowlist)
+files<-paste("~/Desktop/ArchR_analysis/", names, "/filtered_feature_bc_matrix.h5", sep="")
+seRNA <- import10xFeatureMatrix(input = files, names = names)
+
+#Add snRNA-Seq datasets:
+Multiproj<-addGeneExpressionMatrix(input=Multiproj, seRNA=seRNA)
+Multiproj #50060 cells
+
+#Filter Cells
+Multiproj <- Multiproj[!is.na(Multiproj@cellColData$Gex_nGenes) &
+                           Multiproj$TSSEnrichment > 6 & 
+                           Multiproj$nFrags > 2500 & 
+                           Multiproj$Gex_nGenes > 1000 & 
+                           Multiproj$Gex_nUMI > 5000 &
+                           Multiproj$Gex_nGenes < 10000]
+Multiproj #10645 cells
+
+#LSI-ATAC
+Multiproj <- addIterativeLSI(
+  ArchRProj = Multiproj, 
+  clusterParams = list(
+    resolution = 0.2, 
+    sampleCells = 10000,
+    n.start = 10),
+  saveIterations = FALSE,
+  useMatrix = "TileMatrix", 
+  depthCol = "nFrags",
+  name = "LSI_ATAC",
+  force = TRUE)
+
+#LSI-RNA
+Multiproj <- addIterativeLSI(
+  ArchRProj = Multiproj, 
+  clusterParams = list(
+    resolution = 0.2, 
+    sampleCells = 10000,
+    n.start = 10),
+  saveIterations = FALSE,
+  useMatrix = "GeneExpressionMatrix", 
+  depthCol = "Gex_nUMI",
+  varFeatures = 2500,
+  firstSelection = "variable",
+  binarize = FALSE,
+  name = "LSI_RNA",
+  force = TRUE)
+
+#Combined Dims
+Multiproj <- addCombinedDims(Multiproj, reducedDims = c("LSI_ATAC", "LSI_RNA"), name =  "LSI_Combined",
+                              dimWeights = c(5,5))
+
+#UMAPs
+Multiproj <- addUMAP(Multiproj, reducedDims = "LSI_ATAC", name = "UMAP_ATAC", minDist = 0.8, force = TRUE)
+
+# Adding Harmony Batch Correction FOR ATAC data
+Multiproj <- addHarmony(
+  ArchRProj = Multiproj,
+  reducedDims = "LSI_ATAC",
+  dimsToUse = NULL,
+  scaleDims = T,
+  corCutOff = 0.75,
+  name = "Harmony_ATAC",
+  groupBy = c("Sample"),
+  verbose = TRUE,
+  force = T,
+  do_pca = T,
+  theta = c(120),
+  lambda = c(0.3))  
+
+# Make pseudobulk replicates, then Call Peaks
+Multiproj <- addGroupCoverages(ArchRProj = Multiproj, 
+                                groupBy = "Clusters",
+                                minCells = 80,
+                                maxCells = 500,
+                                minReplicates = 3,
+                                maxReplicates = 5,
+                                sampleRatio = 0.8,
+                                force = TRUE,
+                                returnGroups = F)
+
+Multiproj <- addReproduciblePeakSet(
+  ArchRProj = Multiproj, 
+  groupBy = "Clusters", 
+  pathToMacs2 = ".../macs2")
+
+#add a new matrix to Multiproj containing insertion counts within our new merged peak set
+ps <- Multiproj@peakSet
+ps$name <- paste0(seqnames(ps),"_peak",ps$idx)
+Multiproj@peakSet <- ps
+Multiproj <- addPeakMatrix(ArchRProj = Multiproj, force = TRUE, threads = 16)
+
+
+############
+Multiproj <- addClusters(Multiproj, reducedDims = "Harmony_ATAC", name = "Clusters_test", resolution = 0.9, force = TRUE)
+
+# Filter out poor quality and stressed cells - remove C3, C8, C11, C10
+C1 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C1"), ]) #472 cells
+C2 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C2"), ]) #273 cells
+C4 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C4"), ]) #1674 cells
+C5 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C5"), ]) #1674 cells
+C6 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C6"), ]) #1291 cells
+C7 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C7"), ]) #1809 cells
+C9 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C9"), ]) #1809 cells
+C12 <- getCellNames(Multiproj[Multiproj$Clusters_test==c("C12"), ]) #1809 cells
+
+length(c(C1, C2, C4, C5, C6, C7, C9, C12)) # 9147 cells
+
+Multiproj_sub <- subsetArchRProject(
+  ArchRProj = Multiproj,
+  cells = c(C1, C2, C4, C5, C6, C7, C9, C12),
+  outputDirectory = "ArchRSubset_big3",
+  dropCells = TRUE,
+  logFile = NULL,
+  threads = getArchRThreads(),
+  force = FALSE)
+
+Multiproj_sub #7646 cells
+
+# Adding Motif Accessibility
+# Get a list of motif position frequency matrices from the JASPAR database
+pwm_set1 <- getMatrixSet(x = JASPAR2020, opts = list(all_versions = FALSE, species = 9606, collection="CORE", matrixtype="PWM"))
+pwm_set2 <- getMatrixSet(x = JASPAR2020, opts = list(all_versions = FALSE, species = 9606, collection="UNVALIDATED", matrixtype="PWM"))
+# Need to manually add motifs for Pax2, Sall1, Mafb, Wt1 and Twist2 as these are missing from JASPAR2020
+
+names(pwm_set) <- name(pwm_set) #converts Motif IDs to gene names
+pwm_set[duplicated(names(pwm_set)),]
+names(pwm_set) <- make.unique(names(pwm_set)) #adds a unique suffix onto end of duplicates
+pwm_set
+
+Multiproj_sub <- addMotifAnnotations(ArchRProj = Multiproj_sub, 
+                                           motifPWMs = pwm_set, 
+                                           name = "JASPAR", 
+                                           force = TRUE)
+
+Multiproj_sub <- addBgdPeaks(Multiproj_sub, force = TRUE)
+Multiproj_sub <- addDeviationsMatrix(
+  ArchRProj = Multiproj_sub, 
+  peakAnnotation = "Motif",
+  matrixName = "JASPAR",
+  force = TRUE)
+
+# Adding Vierstra annotations
+Multiproj_sub_vierstra <- addMotifAnnotations(
+  ArchRProj = Multiproj_sub,
+  motifSet = "vierstra",
+  name = "Vierstra",
+  collection = "archetype",
+  cutOff = 5e-05,
+  width = 7,
+  version = 2,
+  logFile = createLogFile("addMotifAnnotations"),
+  force = TRUE)
+
+
+### Time point & cell type analysis (Fig. 1) ###
+
+# UMAP & Clustering
+Multiproj_sub <- addImputeWeights(Multiproj_sub, reducedDims = "Harmony_ATAC")
+Multiproj_sub <- addUMAP(Multiproj_sub, reducedDims = "Harmony_ATAC", name = "UMAP_Harmony_ATAC", force = TRUE,
+                         minDist = 0.8, dims = c(1:28))
+Multiproj_sub <- addClusters(Multiproj_sub, reducedDims = "Harmony_ATAC", name = "Clusters_0.1", resolution = 0.1, force = TRUE)
+plotEmbedding(Multiproj_sub, 
+              name = "Clusters_0.1", 
+              embedding = "UMAP_Harmony_ATAC",
+              labelAsFactors=F, 
+              labelMeans=F,
+              colorBy = "cellColData",
+              plotAs = "points",
+              size = 1,
+              baseSize = 10,
+              discreteSet = "stallion")
+
+Multiproj_sub$Clusters_ES[Multiproj_sub$Clusters_0.1=="C1"] <- "Day 10 Epi"
+Multiproj_sub$Clusters_ES[Multiproj_sub$Clusters_0.1=="C2"] <- "Day 12 Epi"
+Multiproj_sub$Clusters_ES[Multiproj_sub$Clusters_0.1=="C3"] <- "Day 14 Epi"
+Multiproj_sub$Clusters_ES[Multiproj_sub$Clusters_0.1=="C4"] <- "Stroma"
+Multiproj_sub$Clusters_ES[Multiproj_sub$Clusters_0.1=="C5"] <- "Stroma"
+Multiproj_sub$Clusters_ES[Multiproj_sub$Clusters_0.1=="C6"] <- "Stroma"
+
+#Plot in Fig. 1E
+plotEmbedding(Multiproj_sub, 
+                    name = "Clusters_ES", 
+                    embedding = "UMAP_Harmony_ATAC",
+                    labelAsFactors=F, 
+                    labelMeans=F,
+                    colorBy = "cellColData",
+                    plotAs = "points",
+                    size = 1,
+                    baseSize = 10,
+                    discreteSet = "stallion")+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_text(hjust = 0, vjust=2.5),
+        axis.title.y=element_text(hjust = 0, vjust=-1.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = 'white', colour = 'white'),
+        line = element_blank())+labs(x="UMAP 1", y = "UMAP 2")
+
+# Gene expression analysis
+markers_ALL_Clusters_ES_GENES <- getMarkerFeatures(
+  ArchRProj = Multiproj_sub, 
+  useMatrix = "GeneExpressionMatrix", 
+  groupBy = "Clusters_ES",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"))
+
+markerList <- getMarkers(markers_ALL_Clusters_ES_GENES, cutOff = "FDR <= 0.01 & Log2FC >= 1")
+markerList.mat <- as.data.frame(markerList)
+sum(markerList.mat$group_name=="Day 10 Epi") #1030
+sum(markerList.mat$group_name=="Day 12 Epi") #388
+sum(markerList.mat$group_name=="Day 14 Epi") #1191
+sum(markerList.mat$group_name=="Stroma") #903
+
+write.csv(markerList.mat[,c(2,7,9,10,11)], file = "~/Desktop/Supplemental Table 2 - Gene expression by cluster.csv")
+
+#Heatmap in Fig. 1G
+heatmapGS <- plotMarkerHeatmap(
+  seMarker = markers_ALL_Clusters_ES_GENES, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 1", 
+  labelMarkers = marker_genes,
+  transpose = F,
+  clusterCols = F,
+  nLabel = 5,
+  nPrint = 5,
+  pal = viridis(100),
+  scaleRows = T,
+  plotLog2FC = T)
+
+draw(heatmapGS, 
+     heatmap_legend_side = "bot", 
+     annotation_legend_side = "bot")
+
+# Chromatin accessibility analysis
+markers_ALL_Clusters_ES_PEAKS <- getMarkerFeatures(
+  ArchRProj = Multiproj_sub, 
+  useMatrix = "PeakMatrix", 
+  groupBy = "Clusters_ES",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"),
+  testMethod = "wilcoxon")
+
+markerList_peaks <- getMarkers(markers_ALL_Clusters_ES_PEAKS, cutOff = "FDR <= 0.01 & Log2FC >= 1")
+markerList_peaks.mat <- as.data.frame(markerList_peaks)
+sum(markerList_peaks.mat$group_name=="Day 10 Epi") #3698
+sum(markerList_peaks.mat$group_name=="Day 12 Epi") #732
+sum(markerList_peaks.mat$group_name=="Day 14 Epi") #3883
+sum(markerList_peaks.mat$group_name=="Stroma") #11827
+
+#Heatmap in Fig. 1I
+heatmapPeaks <- plotMarkerHeatmap(
+  seMarker = markers_ALL_Clusters_ES_PEAKS, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 1", 
+  labelMarkers = NULL,
+  transpose = F,
+  plotLog2FC = TRUE,
+  clusterCols = F,
+  nLabel = 5,
+  nPrint = 5)
+
+draw(heatmapPeaks, 
+     heatmap_legend_side = "bot", 
+     annotation_legend_side = "bot")
+
+# Heatmap of Vierstra families
+markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra <- peakAnnoEnrichment(
+  seMarker = markers_ALL_Clusters_ES_PEAKS,
+  ArchRProj = Multiproj_sub_vierstra,
+  peakAnnotation = "Motif",
+  cutOff = "FDR <= 0.01 & Log2FC >= 1", #selecting peaks that have an FDR <= 0.1 & Log2FC >= 1
+  background = "all")
+
+#Heatmap in Fig. 1J
+heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra <- plotEnrichHeatmap(markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra, n = 20, transpose = F, rastr = F,  clusterCols = T, returnMatrix = T)
+heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra.df <- as.data.frame(heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra)
+heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra.df.split <- str_split(rownames(heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra.df), pattern = "\\(", n = Inf, simplify = T)
+rownames(heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra.df) <- heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra.df.split[,1]
+rownames(heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra.df) <- gsub("\\|", "\\ | ", rownames(heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra.df))
+pheatmap::pheatmap(heatmapEM.markers_ALL_Clusters_ES_PEAKSMotifsUp_vierstra.df, 
+                   cluster_cols = F, 
+                   clustering_method = "ward.D2",
+                   clustering_distance_rows = "minkowski",
+                   treeheight_row = 10)
+
+
+### Epithelium vs Stroma analysis (Fig. 2) ###
+
+#Add custom cluster annotations
+Multiproj$celltype[Multiproj$Clusters_0.1=="C1"] <- "Epithelial"
+Multiproj$celltype[Multiproj$Clusters_0.1=="C2"] <- "Epithelial"
+Multiproj$celltype[Multiproj$Clusters_0.1=="C3"] <- "Epithelial"
+Multiproj$celltype[Multiproj$Clusters_0.1=="C4"] <- "Stromal"
+Multiproj$celltype[Multiproj$Clusters_0.1=="C5"] <- "Stromal"
+Multiproj$celltype[Multiproj$Clusters_0.1=="C6"] <- "Stromal"
+
+# Gene expression
+markers_ALL_EvS_GENES <- getMarkerFeatures(
+  ArchRProj = Multiproj_sub, 
+  useMatrix = "GeneExpressionMatrix", 
+  groupBy = "celltype",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"))
+
+markerList <- getMarkers(markers_ALL_EvS_GENES, cutOff = "FDR <= 0.01 & Log2FC >= 1")
+markerList.mat <- as.data.frame(markerList)
+
+sum(markerList.mat$group_name=="Epithelial") #1802
+sum(markerList.mat$group_name=="Stromal") #727
+
+write.csv(markerList.mat[,c(2,7,9,10,11)], file = "~/Desktop/Supplemental Table 4 - Epithelial vs Stromal genes.csv")
+
+# Heatmap in Fig. 2C
+heatmapGS <- plotMarkerHeatmap(
+  seMarker = markers_ALL_EvS_GENES, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 1", 
+  labelMarkers = marker_genes,
+  transpose = F,
+  plotLog2FC = TRUE,
+  clusterCols = F,
+  nLabel = 5,
+  nPrint = 5,
+  pal = viridis(100))
+draw(heatmapGS, 
+     heatmap_legend_side = "bot", 
+     annotation_legend_side = "bot")
+
+# Peaks
+markers_ALL_EvS_PEAKS <- getMarkerFeatures(
+  ArchRProj = Multiproj_sub, 
+  useMatrix = "PeakMatrix", 
+  groupBy = "celltype",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"),
+  testMethod = "wilcoxon")
+
+markerList_peaks <- getMarkers(markers_ALL_EvS_PEAKS, cutOff = "FDR <= 0.01 & Log2FC >= 1")
+markerList_peaks.mat <- as.data.frame(markerList_peaks)
+
+sum(markerList_peaks.mat$group_name=="Epithelial") #13215
+sum(markerList_peaks.mat$group_name=="Stromal") #9947
+
+# Heatmap in Fig. 2D
+heatmapPeaks <- plotMarkerHeatmap(
+  seMarker = markers_ALL_EvS_PEAKS, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 1", 
+  labelMarkers = NULL,
+  transpose = F,
+  plotLog2FC = TRUE,
+  clusterCols = F,
+  nLabel = 5,
+  nPrint = 5)
+draw(heatmapPeaks, 
+     heatmap_legend_side = "bot", 
+     annotation_legend_side = "bot")
+
+
+# Finding Top TFs based on high gene expression, and motif accessibility
+
+# Step 1. get list of genes significantly upregulated in all epithelium vs stroma
+markers_ALL_EvS_GENES <- getMarkerFeatures(
+  ArchRProj = Multiproj_sub, 
+  useMatrix = "GeneExpressionMatrix", 
+  groupBy = "celltype",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"))
+
+# create a dataframe of Epithelial Marker genes
+ALL_EPImarkersgenes <- data.frame(Gene = markers_ALL_EvS_GENES@elementMetadata@listData$name,
+                                  Log2FC = assays(markers_ALL_EvS_GENES)$Log2FC,
+                                  FDR = assays(markers_ALL_EvS_GENES)$FDR)
+ALL_EPImarkersgenes <- dplyr::arrange(ALL_EPImarkersgenes, FDR.Epithelial)
+
+# Step 2. Identify Correlations between TF Motifs and TF Gene Expression 
+ALL.corGEM_MM <- correlateMatrices(
+  ArchRProj = Multiproj_sub,
+  useMatrix1 = "GeneExpressionMatrix",
+  useMatrix2 = "JASPAR",
+  reducedDims = "Harmony_ATAC")
+
+# STEP 3: Add GeneExpressionFDR to Correlation Data Frame
+ALL.de <- merge(ALL.corGEM_MM, ALL_EPImarkersgenes, by.x="GeneExpressionMatrix_matchName", by.y="Gene", all=TRUE) #Merge cell-pseudotime-bin matrix with cell-gene matrix
+
+# STEP 4: Gets motif enrichment in epithelium vs stroma
+markers_ALL_EvS_JASPAR <- getMarkerFeatures(
+  ArchRProj = Multiproj_sub, 
+  useMatrix = "JASPAR", 
+  groupBy = "celltype",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"))
+
+markers_ALL_EvS_JASPAR.df <- data.frame(Gene = markers_ALL_EvS_JASPAR@elementMetadata$name,
+                                        MeanDiff = assays(markers_ALL_EvS_JASPAR)$MeanDiff)
+rownames(markers_ALL_EvS_JASPAR.df) <- markers_ALL_EvS_JASPAR.df$Gene
+ALL.de <- merge(ALL.de, markers_ALL_EvS_JASPAR.df, by.x="GeneExpressionMatrix_matchName", by.y="Gene", all=F) #Merge cell-pseudotime-bin matrix with cell-gene matrix
+ALL.de <- ALL.de[complete.cases(ALL.de), ]
+nrow(ALL.de) #697
+
+# Step 5. Identify Positive TF Regulators
+ALL.de = ALL.de[!duplicated(ALL.de$GeneExpressionMatrix_matchName),]
+nrow(ALL.de) #691
+ALL.de.df <- as.data.frame(ALL.de)
+ALL.de.df.sub <- subset(ALL.de.df, ALL.de.df$padj < 0.001)
+nrow(ALL.de.df.sub) #312
+ALL.de.df$TFRegulator <- "NO"
+ALL.de.df$TFRegulator[which(ALL.de.df$cor > 0.2 & ALL.de.df$Log2FC.Epithelial > 1.5)] <- "POSITIVE EPI"
+ALL.de.df$TFRegulator[which(ALL.de.df$cor < -0.2 & ALL.de.df$Log2FC.Epithelial > 1.5)] <- "NEGATIVE EPI"
+ALL.de.df$TFRegulator[which(ALL.de.df$cor > 0.2 & ALL.de.df$Log2FC.Epithelial < -1.5)] <- "POSITIVE STROMA"
+ALL.de.df$TFRegulator[which(ALL.de.df$cor < -0.2 & ALL.de.df$Log2FC.Epithelial < -1.5)] <- "NEGATIVE STROMA"
+
+# plot in Fig. 2D
+ggplot(data.frame(ALL.de.df), aes(cor, Log2FC.Epithelial, color = TFRegulator))+
+  geom_point(aes(),size=3) + 
+  geom_vline(xintercept = 0, lty = "dashed", size=0.2)+
+  geom_hline(yintercept = 0, lty = "dashed", size=0.2)+
+  scale_color_manual(values = c("POSITIVE EPI"="firebrick1", "POSITIVE STROMA"="firebrick4", "NEGATIVE EPI"="dodgerblue", "NEGATIVE STROMA"="dodgerblue4", "NO"="darkgrey")) +
+  xlab("Correlation Motif accessibility To Gene Expression") +
+  ylab("Log2FC.Epithelial") +
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = 'white', colour = 'white'),
+        line = element_blank(),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=20))+
+  scale_y_continuous(limits = c(-8,6))+ 
+  scale_x_continuous(limits = c(-1,1))+
+  theme(legend.position = "none")
+
+
+
+### Tube trajectory analysis (Fig. 6) ###
+Multiproj_sub <- addClusters(Multiproj_sub, reducedDims = "Harmony_ATAC", name = "Clusters_0.3", resolution = 0.3, force = TRUE)
+plotEmbedding(Multiproj_sub, 
+              name = "Clusters_0.3", 
+              embedding = "UMAP_Harmony_ATAC",
+              labelAsFactors=F, 
+              labelMeans=F,
+              colorBy = "cellColData",
+              plotAs = "points",
+              size = 1)
+
+# create a trajectory backbone in the form of an ordered vector of cell group labels.
+Tube_trajectory <- c("C3", "C4", "C1")
+
+Multiproj_sub <- addTrajectory(
+  ArchRProj = Multiproj_sub, 
+  name = "Tube_trajectory", 
+  groupBy = "Clusters_0.3",
+  trajectory = Tube_trajectory, 
+  embedding = "UMAP_Harmony_ATAC",
+  force = TRUE,
+  seed = 1,
+  useAll = F,
+  spar = 1.5,
+  preFilterQuantile = 1,
+  postFilterQuantile = 1,
+  saveDF = "~/Desktop/Tube_trajectory.rds")
+
+# trajectory UMAP in Fig. 6A
+test <- getCellNames(Multiproj_sub[complete.cases(Multiproj_sub@cellColData$Tube_trajectory), ])
+Multiproj_sub@cellColData$Tube_trajectory_test <- Multiproj_sub@cellColData$Tube_trajectory
+Multiproj_sub@cellColData$Tube_trajectory_test[is.na(Multiproj_sub@cellColData$Tube_trajectory_test)] <- 0
+#Tube_trajectory_test is the trajectory with 0s instead of NAs - just for plotting!
+
+plotEmbedding(ArchRProj = Multiproj_sub, colorBy = "cellColData", name = "Tube_trajectory_test", embedding = "UMAP_Harmony_ATAC",
+                    plotAs = "points",
+                    size = 1,
+                    rastr = F,
+                    continuousSet = "horizonExtra",
+                    labelMeans = FALSE,
+                    highlightCells = test)+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1), 
+        axis.ticks.x=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.title.x=element_text(hjust = 0, vjust=2.5),
+        axis.title.y=element_text(hjust = 0, vjust=-1.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = 'white', colour = 'white'),
+        line = element_blank(),
+        plot.title = element_text(hjust = 0, vjust=-1.5)
+  )+labs(title=NULL,x="UMAP 1", y ="UMAP 2")
+
+
+# making cluster labels for trajectory plots
+library(dplyr)
+ann_colors.2 = list(Time_point = c("2_Day_10" = "#D51F26", "2_Day_12" = "#272E6A", "2_Day_14" = "#208A42"))
+lab <- data.frame(Multiproj_sub$cellNames)
+lab$Pseudotime <- Multiproj_sub$Tube_trajectory
+lab$Time_point <- Multiproj_sub$Sample
+lab <- lab[complete.cases(lab), ]
+lab$bins <- as.numeric(cut(lab$Pseudotime, 100, labels = FALSE))
+lab <- dplyr::arrange(lab$Pseudotime)
+lab %>% 
+  group_by(bins) %>% 
+  count(Time_point) -> lab
+lab <- as.data.frame(lab)
+lab = lab[order(lab[,'bins'],-lab[,'n']),]
+lab = lab[!duplicated(lab$bins),]
+lab$n <- NULL
+lab$bins <- NULL
+rownames(lab) <- 1:100
+
+# Getting and manipulating trajectories
+Tube_trajMM  <- getTrajectory(ArchRProj = Multiproj_sub, name = "Tube_trajectory", useMatrix = "JASPAR", log2Norm = FALSE, scaleTo = NULL) # motif trajectory
+Tube_trajGEM <- getTrajectory(ArchRProj = Multiproj_sub, name = "Tube_trajectory", useMatrix = "GeneExpressionMatrix", log2Norm = TRUE) # gene expression trajectory
+
+# Calculating correlations between TF gene expression and TF motif accessibility
+ALLcorGEM_MM <- correlateTrajectories(Tube_trajGEM, Tube_trajMM,
+                                      removeFromName1 = c("underscore"),
+                                      corCutOff = -1,
+                                      varCutOff1 = 0.55,
+                                      varCutOff2 = 0.55)
+
+ALLcorGEM_MM[[1]]$name2
+ALLcorGEM_MM[[1]] <- ALLcorGEM_MM[[1]][!grepl("deviations", ALLcorGEM_MM[[1]]$name2),] #Removes "deviations" from names 
+ALLcorGEM_MM[[1]]$name2
+
+ALLcorGEM_MM.cor.1var0.55 <- data.frame(ALLcorGEM_MM[[1]])
+ALLcorGEM_MM.cor.1var0.55 <- data.frame(ALLcorGEM_MM.cor.1var0.55$matchname1, 
+                                        ALLcorGEM_MM.cor.1var0.55$Correlation, 
+                                        ALLcorGEM_MM.cor.1var0.55$FDR)
+colnames(ALLcorGEM_MM.cor.1var0.55) <- c("Gene", "Correlation", "Correlation_FDR")
+
+# markersGS.df.ALL is a sheet of differentially expressed genes between epithelium and stroma across all time points
+markersGS.df.ALL <- data.frame(ALL_EPImarkersgenes$Gene,
+                               ALL_EPImarkersgenes$Log2FC.Epithelial,
+                               ALL_EPImarkersgenes$FDR.Epithelial)
+colnames(markersGS.df.ALL) <- c("Gene", "Log2FC", "FDR")
+head(markersGS.df.ALL) 
+
+# markers_ALL_EvS_MotifsUp.df is a sheet of differentially accessible motifs between epithelium and stroma across all time points
+markers_ALL_EvS_MotifsUp.all <- peakAnnoEnrichment(
+  seMarker = markers_ALL_EvS_PEAKS,
+  ArchRProj = Multiproj_sub,
+  peakAnnotation = "Motif",
+  cutOff = "FDR <= 0.1 & Log2FC >= 0.5", #selecting peaks that have an FDR <= 0.1 and a Log2FC >= 0.5
+  background = "all")
+markers_ALL_EvS_MotifsUp.df <- data.frame(feature = assays(markers_ALL_EvS_MotifsUp.all)$feature,
+                                              mlog10Padj = assays(markers_ALL_EvS_MotifsUp.all)$mlog10Padj,
+                                              Enrichment = assays(markers_ALL_EvS_MotifsUp.all)$Enrichment)
+markers_ALL_EvS_MotifsUp.df <- markers_ALL_EvS_MotifsUp.df[, c(1,3,5)]
+colnames(markers_ALL_EvS_MotifsUp.df) <- c("Gene","Motif_EPI_enrichment_mlog10Padj", "Motif_EPI_fold_enrichment")
+
+# markers_ALL_EvS_JASPAR.df is a sheet of differentially accessible motifs between epithelium and stroma across all time points USING JASPAR DEVIATIONS
+markers_ALL_EvS_JASPAR <- getMarkerFeatures(
+  ArchRProj = Multiproj_sub, 
+  useMatrix = "JASPAR", 
+  groupBy = "celltype",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)", "log10(Gex_nUMI)"))
+
+markers_ALL_EvS_JASPAR.df <- data.frame(Gene = markers_ALL_EvS_JASPAR@elementMetadata$name,
+                                        MeanDiff = assays(markers_ALL_EvS_JASPAR)$MeanDiff,
+                                        FDR = assays(markers_ALL_EvS_JASPAR)$FDR)
+markers_ALL_EvS_JASPAR.df <- markers_ALL_EvS_JASPAR.df[, c(1,2,4)]
+colnames(markers_ALL_EvS_JASPAR.df) <- c("Gene","Jaspar_enrichment_epithelial_FDR", "Jaspar_MeanDiff_epithelial")
+
+
+
+# Motifs_enrichment_correlations contains correlations, and motif accessibility
+Motifs_enrichment_correlations <- merge(ALLcorGEM_MM.cor.1var0.55, markers_ALL_EvS_MotifsUp.df, by.x = "Gene", by.y = "Gene", all = F)
+Motifs_enrichment_correlations <- merge(Motifs_enrichment_correlations, markers_ALL_EvS_JASPAR.df, by.x = "Gene", by.y = "Gene", all = F)
+
+nrow(Motifs_enrichment_correlations) #375
+
+Motifs_enrichment_correlations$label <- "NO"
+Motifs_enrichment_correlations$label[Motifs_enrichment_correlations$Correlation > 0.2] <- "ACTIVATOR"
+Motifs_enrichment_correlations$label[Motifs_enrichment_correlations$Correlation < -0.2] <- "REPRESSOR"
+Motifs_enrichment_correlations$delabel <- NA
+Motifs_enrichment_correlations$delabel[Motifs_enrichment_correlations$label != "NO"] <- Motifs_enrichment_correlations$Gene[Motifs_enrichment_correlations$label != "NO"]
+
+Motifs_enrichment_correlations$label2 <- "NO"
+Motifs_enrichment_correlations$label2[Motifs_enrichment_correlations$Jaspar_MeanDiff_epithelial > 0] <- "EPI_Enriched"
+Motifs_enrichment_correlations$label2[Motifs_enrichment_correlations$label == "NO"] <- "NO"
+Motifs_enrichment_correlations$delabel2 <- NA
+Motifs_enrichment_correlations$delabel2[Motifs_enrichment_correlations$label2 != "NO"] <- Motifs_enrichment_correlations$Gene[Motifs_enrichment_correlations$label2 != "NO"]
+
+###### Gene_Motif_sheet contains correlations, motif accessibility, and gene expression #####
+Gene_Motif_sheet <- merge(Motifs_enrichment_correlations, markersGS.df.ALL, by.x="Gene", by.y="Gene", all=F)
+nrow(Gene_Motif_sheet) #406
+head(Gene_Motif_sheet)
+
+# Finding positive correlations (activators)
+corGEM_MM <- correlateTrajectories(Tube_trajGEM, Tube_trajMM,
+                                   removeFromName1 = c("underscore"),
+                                   corCutOff = 0.2,
+                                   varCutOff1 = 0.55,
+                                   varCutOff2 = 0.55)
+nrow(corGEM_MM[[1]]) #149
+corGEM_MM[[1]] <- corGEM_MM[[1]][!grepl("deviations", corGEM_MM[[1]]$name2),] #Removes "deviations" 
+Tube_trajGEM2 <- Tube_trajGEM[corGEM_MM[[1]]$name1, ]
+Tube_trajMM2 <- Tube_trajMM[corGEM_MM[[1]]$name2, ]
+
+#Prepare gene names in GEX matrix #### Removes 'CHR:'
+split <- str_split(rownames(Tube_trajGEM2), pattern = ":", n = Inf, simplify = T)
+rownames(Tube_trajGEM2) <- split[,2]
+
+#Prepare gene names in Motif matrix #### Removes 'z:'
+split <- str_split(rownames(Tube_trajMM2), pattern = ":", n = Inf, simplify = T)
+rownames(Tube_trajMM2) <- split[,2]
+
+# Ordering genes
+pos_mat_gem <- plotTrajectoryHeatmap(Tube_trajGEM2, varCutOff = 0, force=TRUE,
+                                     returnMatrix = T)
+pos_mat_mm <- plotTrajectoryHeatmap(Tube_trajMM2,  varCutOff = 0,
+                                    returnMatrix = T)
+
+# Ordering genes by gene expression - find first instance of 50% of max value
+pos_mat_gem.2 <- pos_mat_gem
+pos_mat_gem.2 <- subset(pos_mat_gem.2, rownames(pos_mat_gem.2) %in% Gene_Motif_sheet$Gene)
+
+#Convert all numbers in matrix to percentage values of max
+pos_mat_gem.2.pct <- as.data.frame(t(apply(pos_mat_gem.2, 1, function(x) x/max(x) * 100)))
+
+#Caps the data at 50%
+pos_mat_gem.2.pct[pos_mat_gem.2.pct > 50 ] <- 50
+
+#Find first instance of 50 for each TF
+TF_50_Pseudovalue_POS <- as.data.frame(colnames(pos_mat_gem.2.pct)[apply(pos_mat_gem.2.pct,1,which.max)])
+TF_50_Pseudovalue_POS$TF <- rownames(pos_mat_gem.2.pct)
+colnames(TF_50_Pseudovalue_POS)[1] <- "first_50_pseudovalue"
+TF_50_Pseudovalue_POS$first_50_pseudovalue <- gsub("T.","",as.character(TF_50_Pseudovalue_POS$first_50_pseudovalue))
+TF_50_Pseudovalue_POS$first_50_pseudovalue <- gsub("[0-9]+_", "",as.character(TF_50_Pseudovalue_POS$first_50_pseudovalue))
+TF_50_Pseudovalue_POS$first_50_pseudovalue <- as.numeric(TF_50_Pseudovalue_POS$first_50_pseudovalue)
+TF_50_Pseudovalue_POS <- dplyr::arrange(TF_50_Pseudovalue_POS, first_50_pseudovalue)
+rowOrder.pos3 <- match(TF_50_Pseudovalue_POS$TF, rownames(Tube_trajGEM2))
+rowOrder.pos4 <- match(TF_50_Pseudovalue_POS$TF, rownames(Tube_trajMM2))
+
+pos_mat_gem <- plotTrajectoryHeatmap(Tube_trajGEM2, pal = paletteContinuous(set = "solarExtra"), varCutOff = 0, rowOrder = rowOrder.pos3, force=TRUE,
+                                     labelTop = 100,
+                                     returnMatrix = T,
+                                     scaleRows = T)
+
+pos_mat_mm <- plotTrajectoryHeatmap(Tube_trajMM2,  pal = paletteContinuous(set = "horizonExtra"),  varCutOff = 0, rowOrder = rowOrder.pos4,
+                                    labelTop = 100,
+                                    returnMatrix = T,
+                                    scaleRows = T)
+
+colnames(pos_mat_gem) <- c(1:100)
+colnames(pos_mat_mm) <- c(1:100)
+
+pos_mat_gem_trim <- pos_mat_gem
+Gene_Motif_sheet_ACT <- subset(Gene_Motif_sheet, label == "ACTIVATOR")
+nrow(Gene_Motif_sheet_ACT) #148
+Gene_Motif_sheet_ACT <- subset(Gene_Motif_sheet_ACT, Gene_Motif_sheet_ACT$Motif_EPI_fold_enrichment > 1)
+Gene_Motif_sheet_ACT <- subset(Gene_Motif_sheet_ACT, Gene_Motif_sheet_ACT$Correlation_FDR < 0.001)
+Gene_Motif_sheet_ACT <- subset(Gene_Motif_sheet_ACT, Gene_Motif_sheet_ACT$Correlation > 0.2)
+pos_mat_gem_trim <- subset(pos_mat_gem_trim, rownames(pos_mat_gem_trim) %in% Gene_Motif_sheet_ACT$Gene)
+
+newnames <- lapply(
+  rownames(pos_mat_gem_trim),
+  function(x) bquote(italic(.(x))))
+
+# Heatmaps in Fig. 6D
+pheatmap::pheatmap(pos_mat_gem_trim, fontsize_row = 10, show_colnames = F, cluster_cols = F, cluster_rows = F,
+                   color = viridis(100),
+                   border_color = NA,
+                   annotation_col=lab, 
+                   annotation_colors = ann_colors.2,
+                   labels_row = as.expression(newnames))
+
+pos_mat_mm_trim <- pos_mat_mm
+pos_mat_mm_trim <- subset(pos_mat_mm_trim, rownames(pos_mat_mm_trim) %in% Gene_Motif_sheet_ACT$Gene)
+pheatmap::pheatmap(pos_mat_mm_trim, fontsize_row = 10, show_colnames = F, cluster_cols = F, cluster_rows = F,
+                   color = inferno(100), border_color = NA,
+                   annotation_col=TEST2, 
+                   annotation_colors = ann_colors.2)
+
+# Negative correlation (repressors)
+negcorGEM_MM  <- correlateTrajectories(Tube_trajGEM, Tube_trajMM,
+                                       removeFromName1 = c("underscore"),
+                                       corCutOff = -1,
+                                       varCutOff1 = 0.55,
+                                       varCutOff2 = 0.55)
+nrow(negcorGEM_MM [[1]]) #149
+
+#REMOVES "deviations" 
+negcorGEM_MM [[1]]$name2
+negcorGEM_MM [[1]] <- negcorGEM_MM [[1]][!grepl("deviations", negcorGEM_MM [[1]]$name2),]
+negcorGEM_MM [[1]]$name2
+
+Tube_trajGEM2 <- Tube_trajGEM[negcorGEM_MM [[1]]$name1, ]
+Tube_trajMM2 <- Tube_trajMM[negcorGEM_MM [[1]]$name2, ]
+split <- str_split(rownames(Tube_trajGEM2), pattern = ":", n = Inf, simplify = T) # Removes 'CHR:'
+rownames(Tube_trajGEM2) <- split[,2]
+split <- str_split(rownames(Tube_trajMM2), pattern = ":", n = Inf, simplify = T) # Removes 'z:'
+rownames(Tube_trajMM2) <- split[,2]
+
+# Ordering genes by gene expression - find first instance of 50% of max value
+neg_mat_gem <- plotTrajectoryHeatmap(Tube_trajGEM2, varCutOff = 0, force=TRUE,
+                                     returnMatrix = T)
+
+neg_mat_mm <- plotTrajectoryHeatmap(Tube_trajMM2,  varCutOff = 0,
+                                    returnMatrix = T)
+neg_mat_gem.2 <- neg_mat_gem
+neg_mat_gem.2 <- subset(neg_mat_gem.2, rownames(neg_mat_gem.2) %in% Gene_Motif_sheet$Gene)
+neg_mat_gem.2.pct <- as.data.frame(t(apply(neg_mat_gem.2, 1, function(x) x/max(x) * 100)))
+neg_mat_gem.2.pct[neg_mat_gem.2.pct > 50 ] <- 50
+TF_50_Pseudovalue_POS <- as.data.frame(colnames(neg_mat_gem.2.pct)[apply(neg_mat_gem.2.pct,1,which.max)])
+TF_50_Pseudovalue_POS$TF <- rownames(neg_mat_gem.2.pct)
+colnames(TF_50_Pseudovalue_POS)[1] <- "first_50_pseudovalue"
+TF_50_Pseudovalue_POS$first_50_pseudovalue <- gsub("T.","",as.character(TF_50_Pseudovalue_POS$first_50_pseudovalue))
+TF_50_Pseudovalue_POS$first_50_pseudovalue <- gsub("[0-9]+_", "",as.character(TF_50_Pseudovalue_POS$first_50_pseudovalue))
+TF_50_Pseudovalue_POS$first_50_pseudovalue <- as.numeric(TF_50_Pseudovalue_POS$first_50_pseudovalue)
+TF_50_Pseudovalue_POS <- dplyr::arrange(TF_50_Pseudovalue_POS, first_50_pseudovalue)
+rowOrder.neg3 <- match(TF_50_Pseudovalue_POS$TF, rownames(Tube_trajGEM2))
+rowOrder.neg4 <- match(TF_50_Pseudovalue_POS$TF, rownames(Tube_trajMM2))
+
+neg_mat_gem <- plotTrajectoryHeatmap(Tube_trajGEM2, pal = paletteContinuous(set = "solarExtra"), varCutOff = 0, rowOrder = rowOrder.neg3, force=TRUE,
+                                     labelTop = 100,
+                                     returnMatrix = T,
+                                     scaleRows = T)
+neg_mat_mm <- plotTrajectoryHeatmap(Tube_trajMM2,  pal = paletteContinuous(set = "horizonExtra"),  varCutOff = 0, rowOrder = rowOrder.neg4,
+                                    labelTop = 100,
+                                    returnMatrix = T,
+                                    scaleRows = T)
+colnames(neg_mat_gem) <- c(1:100)
+colnames(neg_mat_mm) <- c(1:100)
+
+# Trimming heatmaps to epithelial enriched motifs
+neg_mat_gem_trim <- neg_mat_gem
+Gene_Motif_sheet_REP <- subset(Gene_Motif_sheet, label == "REPRESSOR")
+nrow(Gene_Motif_sheet_REP) #148
+Gene_Motif_sheet_REP <- subset(Gene_Motif_sheet_REP, Gene_Motif_sheet_REP$Motif_EPI_fold_enrichment > 1) # could also subset with [& label2 == "EPI_Enriched"]
+Gene_Motif_sheet_REP <- subset(Gene_Motif_sheet_REP, Gene_Motif_sheet_REP$Correlation_FDR < 0.001)
+Gene_Motif_sheet_REP <- subset(Gene_Motif_sheet_REP, Gene_Motif_sheet_REP$Correlation < -0.2)
+neg_mat_gem_trim <- subset(neg_mat_gem_trim, rownames(neg_mat_gem_trim) %in% Gene_Motif_sheet_REP$Gene)
+
+newnames <- lapply(
+  rownames(neg_mat_gem_trim),
+  function(x) bquote(italic(.(x))))
+
+# Heatmaps in Fig. 6E
+pheatmap::pheatmap(neg_mat_gem_trim, fontsize_row = 10, show_colnames = F, cluster_cols = F, cluster_rows = F,
+                   color = viridis(100),
+                   border_color = NA,
+                   annotation_col=lab, 
+                   annotation_colors = ann_colors.2,
+                   labels_row = as.expression(newnames))
+
+neg_mat_mm_trim <- neg_mat_mm
+neg_mat_mm_trim <- subset(neg_mat_mm_trim, rownames(neg_mat_mm_trim) %in% Gene_Motif_sheet_REP$Gene)
+pheatmap::pheatmap(neg_mat_mm_trim, fontsize_row = 10, show_colnames = F, cluster_cols = F, cluster_rows = F,
+                   color = viridis(100, option="B"),
+                   border_color = NA,
+                   annotation_col=lab, 
+                   annotation_colors = ann_colors.2,
+                   labels_row = as.expression(newnames))
+
+
+
+
+# Peak to gene links
+Multiproj_sub <- addPeak2GeneLinks(
+  ArchRProj = Multiproj_sub,
+  reducedDims = "Harmony_ATAC",
+  useMatrix = "GeneExpressionMatrix",
+  cellsToUse = NULL,
+  addEmpiricalPval = T,
+  addPermutedPval = T,
+  nperm = 10,
+  maxDist = 500000)
+
+#### Following Regner et al. 2019 Github ####
+#### Making HOMER compatible table ####
+p2geneDF <- metadata(Multiproj_sub@peakSet)$Peak2GeneLinks
+p2geneDF$geneName <- mcols(metadata(p2geneDF)$geneSet)$name[p2geneDF$idxRNA]
+p2geneDF$peakName <- (metadata(p2geneDF)$peakSet %>% {paste0(seqnames(.), ":", start(.), "-", end(.))})[p2geneDF$idxATAC]
+annot <- readRDS(metadata(p2geneDF)$seATAC)
+p2geneDF$peakType <- annot@rowRanges$peakType[p2geneDF$idxATAC]
+p2geneDF$nearestGene <- annot@rowRanges$nearestGene[p2geneDF$idxATAC]
+p2geneDF$GroupReplicate <- annot@rowRanges$GroupReplicate[p2geneDF$idxATAC]
+p2geneDF.peaks <- as.data.frame(metadata(p2geneDF)[[1]]) #Peak index
+p2geneDF.peaks$idxATAC <- rownames(p2geneDF.peaks)
+p2geneDF.merged <- merge(p2geneDF, p2geneDF.peaks, by = 'idxATAC')
+p2g.df.obs <- as.data.frame(p2geneDF.merged)
+p2g.df.obs <- p2g.df.obs[complete.cases(p2g.df.obs),]
+p2g.df.obs$Unique_Peak_ID <- rownames(p2g.df.obs)
+p2g.df.obs$strand <- "+"
+names(p2g.df.obs)[names(p2g.df.obs) == "seqnames"] <- "chromosome"
+names(p2g.df.obs)[names(p2g.df.obs) == "start"] <- "starting position"
+names(p2g.df.obs)[names(p2g.df.obs) == "end"] <- "ending position"
+
+#use with PermFDR:
+p2g.df.obs <- p2g.df.obs[, c(22,17,18,19,21,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,20)]
+p2g.df.obs.split <- str_split_fixed(p2g.df.obs$GroupReplicate, '\\.', n=Inf)
+p2g.df.obs$GroupReplicate <- p2g.df.obs.split[,1]
+
+#subset to significant thresholds
+p2g.df.obs.sub <- subset(p2g.df.obs[p2g.df.obs$FDR < 1e-4,])
+p2g.df.obs.sub <- subset(p2g.df.obs.sub[p2g.df.obs.sub$Correlation > 0.4,])
+nrow(p2g.df.obs.sub)#91741
+
+# Can use p2g.df.obs.sub as input to HOMER motif analysis
+
