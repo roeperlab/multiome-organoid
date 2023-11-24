@@ -41,7 +41,7 @@ links[,4] = toupper(links[,4])
 links <- links[!duplicated(links$Unique_Peak_ID),]
 links <- arrange(links, links$geneName)
 
-write.csv(links, file = "~/Desktop/PAX8_All_links_Cor04_FDR1e4.csv")
+write.csv(links, file = "~/Desktop/Predicted_PAX8_regulon.csv") # tab a) in Supplemental Table 5
 
 
 
